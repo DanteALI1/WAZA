@@ -17,10 +17,12 @@
 | ВМ | Роль | vCPU | RAM | OS disk | Data SSD | Поды |
 |---|---|---:|---:|---:|---:|---|
 | `k8s-indexer` | control-plane + worker | 8 | 32 Gi | 80 Gi | **300 Gi** | `wazuh-indexer-0` |
-| `k8s-manager` | worker | 8 | 16 Gi | 80 Gi | **100 Gi** | `wazuh-manager-master-0`, `wazuh-manager-worker-0` |
+| `k8s-manager` | worker | 8 | **16–24 Gi** (предпочтительно 24) | 80 Gi | **100 Gi** | `wazuh-manager-master-0`, `wazuh-manager-worker-0` |
 | `k8s-dashboard` | worker | 4 | 8 Gi | 60 Gi | — | `wazuh-dashboard` |
 
 **Поды:** 1 master + 1 worker + 1 indexer + 1 dashboard.
+
+Почему столько ресурсов и насколько схема рабочая — см. [wazuh-sizing-review.md](wazuh-sizing-review.md). Кратко: диск indexer 300 Gi = 235 GB primary + 25%; indexer-ВМ 32 Gi из‑за совмещения с control-plane; на manager не ставить оба пода с limit 8 Gi при ВМ 16 Gi.
 
 **Сеть:**
 
@@ -770,10 +772,10 @@ vi envs/local-env/storage-class.yaml
 
 | Компонент | replicas | CPU lim | RAM lim | PVC | nodeSelector |
 |---|---:|---|---|---|---|
-| manager-master | 1 | 4 | 8 Gi | 50 Gi | `role=manager` |
+| manager-master | 1 | **2** | **4 Gi** | 50 Gi | `role=manager` |
 | manager-worker | **1** | 4 | 8 Gi | 50 Gi | `role=manager` |
-| indexer | **1** | 4 | 16 Gi | **300 Gi** | `role=indexer` |
-| dashboard | 1 | 1 | 2 Gi | — | `role=dashboard` |
+| indexer | **1** | 4 | **20–24 Gi** (heap 8g) | **300 Gi** | `role=indexer` |
+| dashboard | 1 | 2 | 4 Gi | — | `role=dashboard` |
 
 Практически:
 
@@ -802,10 +804,10 @@ spec:
         resources:
           requests:
             cpu: "2"
-            memory: 8Gi
+            memory: 12Gi
           limits:
             cpu: "4"
-            memory: 16Gi
+            memory: 24Gi
         env:
         - name: OPENSEARCH_JAVA_OPTS
           value: "-Xms8g -Xmx8g"
