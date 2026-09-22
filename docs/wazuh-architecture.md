@@ -1,320 +1,402 @@
-# Архитектура Wazuh в Kubernetes (полная)
+# Архитектура Wazuh в Kubernetes на VMware ESXi 7
 
-Production-план для **до 100** и **до 1000** агентов, включая **жизненный цикл данных после 90 дней**.
+Production-контур для **до 100** и **до 1000** агентов:
 
-Версия ориентира манифестов: Wazuh **4.14.x** (`wazuh-kubernetes` tag `v4.14.7`).
+- создание ВМ в **ESXi 7** (параметры hardware);
+- разметка дисков при установке ОС (РЕД ОС 8 / Astra SE 1.7 / 1.8);
+- HOT 90 дней + отдельный сервер **ARCHIVE**;
+- ежедневная архивация снимков и **просмотр старых данных в Wazuh Dashboard** через Restore.
+
+Установка: [wazuh-install.md](wazuh-install.md).  
+Манифесты: Wazuh **4.14.x** (`wazuh-kubernetes` `v4.14.7`).
 
 ---
 
-## 1. Ключевой принцип: куда деваются события через 90 дней
-
-### 1.1. Что хранит indexer
-
-| Индекс / поток | Содержимое | По умолчанию без политики |
-|---|---|---|
-| `wazuh-alerts-*` | Сработавшие правила (алерты) | Растут, пока диск не кончится |
-| `wazuh-archives-*` | Все события (если включён archives в Filebeat) | Очень объёмно; **по умолчанию в этом плане выключено** |
-| `wazuh-statistics-*`, мониторинг | Служебные метрики | Короткий retention |
-
-Официальный sizing диска (GB/агент/90 дней) относится к **алертам в indexer**: WS 1.5 / server 3.7 / network 7.4.
-
-### 1.2. Если «просто поставить 90 дней» и ничего больше
-
-Индексы старше 90 суток удаляются политикой **ISM (Index State Management)** → данные **безвозвратно исчезают**.  
-**Автоматического архива «куда-то на полку» у Wazuh нет**, пока вы сами не настроите **Snapshot Management** (официальный путь — NFS/`path.repo` или S3-совместимое хранилище).
-
-### 1.3. Принятая в этой архитектуре модель (обязательная)
+## 1. Жизненный цикл данных (обязательно понять)
 
 ```
-Агенты → Manager workers → Filebeat
-                              ↓
-                    Indexer HOT (SSD)
-                    поиск online ≤ 90 дней
-                              ↓
-              ежедневный snapshot (+ снимок перед delete)
-                              ↓
-                    ARCHIVE (NFS или MinIO/S3)
-                    холодное хранение N лет
-                              ↓
-              ISM delete индекса из HOT
-                              ↓
-         при расследовании: Restore snapshot → временный индекс → UI
+Агенты → workers → Filebeat → Indexer HOT (SSD, поиск 0–90 дней)
+                                      │
+                         ежедневно 02:00 snapshot
+                                      ▼
+                         ARCHIVE-сервер (NFS, отдельная ВМ)
+                         хранение снимков ≥ 1 год
+                                      │
+                         ISM: индекс старше 90d → delete с HOT
+                                      │
+              расследование: Restore snapshot → индекс снова в HOT
+                           → смотрите в Dashboard (Discover / Security events)
+                           → после работы удалить восстановленный индекс
 ```
 
-| Этап | Срок (рекомендация) | Где | Доступ из Dashboard |
-|---|---|---|---|
-| **HOT** | 0–90 дней | PVC indexer, SSD | Да, сразу |
-| **ARCHIVE** | 90 дней → **1 год** (минимум); опционально 3 года | Отдельная ВМ NFS или MinIO | Нет, пока не сделан Restore |
-| **После ARCHIVE** | удаление снимков по политике | — | Нет |
-
-**Итог:** через 90 дней события **не «уходят сами»** — они либо **удаляются**, либо (в нашем плане) **уже лежат в снимках на ARCHIVE**, а с HOT удаляются. Без ВМ/тома ARCHIVE схема с retention 90 дней = потеря истории.
+| Вопрос | Ответ |
+|---|---|
+| Куда уходят события через 90 дней сами? | **Никуда.** Без ARCHIVE ISM их **удаляет навсегда**. |
+| Архивация есть из коробки? | **Нет.** Нужен Snapshot Repository (NFS/`path.repo` — официальный путь Wazuh). |
+| Как смотреть старое в Wazuh? | Только после **Restore** снимка в indexer → UI как обычно. |
+| `wazuh-archives-*`? | Другое: поток «все события». В этой архитектуре **выключен** (съест диск). |
 
 ---
 
 ## 2. Допущения
 
-- Парк: ~70% workstations / ~25% servers / ~5% network
-- Retention HOT (алерты): **90 дней**
-- Retention ARCHIVE: **365 дней** (базовый контракт); параметр `ARCHIVE_YEARS` можно поставить 3
-- Archives-индекс (`wazuh-archives-*`) **выключен** (иначе диск ×5–20)
-- Sizing от APS/retention, не только от числа агентов
-- Масштабирование manager — **workers**; сигналы: `events_dropped`, `discarded_count`
-- Indexer: только SSD; heap = ½ целевого RAM пода (`-Xms=-Xmx`)
-- Не использовать lab-лимиты wazuh-kubernetes EKS overlay (1 CPU / 2 Gi / 10 Gi)
+- Парк: ~70% WS / ~25% servers / ~5% network
+- HOT retention алертов: **90 дней**
+- ARCHIVE retention снимков: **365 дней** (опционально 3 года)
+- Hypervisor: **VMware ESXi 7.x** (+ vCenter по возможности)
+- ОС гостей: РЕД ОС 8 **или** Astra Linux SE 1.7 / 1.8
+- Datastore HOT-дисков: **SSD/NVMe**; ARCHIVE data: SSD или HDD
+- Sizing диска indexer (GB/агент/90d): WS 1.5 / server 3.7 / network 7.4
+- Масштаб manager — workers; сигналы: `events_dropped`, `discarded_count`
+- Heap indexer = половина целевого RAM пода
 
 ---
 
-## 3. Компоненты
+## 3. Логическая топология (100 агентов — рекомендуемый старт)
 
-| Компонент | Kind | Роль | Порты |
-|---|---|---|---|
-| `wazuh-manager-master` | STS ×1 | authd, API, cluster | 1515, 55000, 1516 |
-| `wazuh-manager-worker` | STS ×N | events, analysisd, Filebeat | 1514 → 9200 |
-| `wazuh-indexer` | STS ×M | HOT хранение/поиск | 9200, 9300 |
-| `wazuh-dashboard` | Deploy ×K | UI | 443/5601 |
-| **archive-store** | ВМ NFS **или** MinIO в K8s/ВМ | снимки индексов | 2049 (NFS) / 9000 (S3) |
-| LB / Ingress | — | агенты и UI | 1514, 1515, 443 |
-
-```
-[Agents] :1515→ LB → master
-[Agents] :1514→ LB → workers → Filebeat → indexer :9200
-[Users]  :443 → Ingress → dashboard → API :55000 + indexer
-[Indexer] snapshot → ARCHIVE (NFS/MinIO)
-```
-
-Anti-affinity: не два indexer на одну ВМ; managers разносить по возможности.
-
----
-
-## 4. Политика данных (ISM + Snapshot) — детально
-
-### 4.1. Расписание снимков
-
-| Тип | Когда | Что | Зачем |
-|---|---|---|---|
-| Incremental / indices | **ежедневно** 02:00 | `wazuh-alerts-*` (+ cluster state) | не потерять сутки при аварии диска HOT |
-| Pre-delete | в ISM перед удалением (или отдельный job за 1–2 дня до delete) | индексы, которым → 90d | гарантия, что уходящий с HOT уже в ARCHIVE |
-| Проверка | ежедневно | `GET _snapshot/.../_all` + алерт если fail | иначе «думали что архив есть» |
-
-### 4.2. ISM (логика)
-
-1. Index rollover / daily indices (как принято в Wazuh).
-2. Состояние **hot**: 0–90 дней, searchable.
-3. Перед удалением: убедиться, что индекс включён в успешный snapshot (SM policy / external cron).
-4. Состояние **delete**: удалить индекс с HOT.
-
-> OpenSearch ISM сам по себе **не копирует** данные на NFS. Сначала Snapshot Management (или `_snapshot` API), потом delete.
-
-### 4.3. Восстановление
-
-1. Indexer Management → Snapshot Management → Restore.
-2. Восстановить в имя без конфликта (или убрать `restored_` prefix по доке Wazuh).
-3. После расследования — снова удалить восстановленный индекс с HOT (чтобы не съесть SSD).
-
-### 4.4. Чего нельзя делать
-
-- Считать PVC indexer «архивом» и копить >90 дней «на всякий случай» без роста диска.
-- Хранить единственную копию снимков на том же SSD, что HOT.
-- Включать `wazuh-archives-*` без отдельного расчёта диска (это не замена snapshot-архиву алертов).
-
----
-
-## 5. Расчёт диска HOT и ARCHIVE
-
-### 5.1. Формулы
-
-```
-HOT_primary_90d = N_ws×1.5 + N_srv×3.7 + N_net×7.4   (GB)
-HOT_cluster     = HOT_primary_90d × (1 + replica) × 1.25   # replica=1 → ×2×1.25
-HOT_single      = HOT_primary_90d × 1.25                   # compact без replica shards
-
-ARCHIVE_year    ≈ HOT_primary_90d × (365/90) × 0.85       # ~0.85 из‑за сжатия снимков
-ARCHIVE_years   = ARCHIVE_year × ARCHIVE_YEARS
-```
-
-`0.85` — консервативно (снимки часто жмут сильнее; не занижаем диск ARCHIVE).
-
-### 5.2. Сценарий 100 агентов (70/25/5)
-
-| Величина | Значение |
-|---|---|
-| HOT primary 90d | **235 GB** |
-| HOT PVC compact (single) | **300 Gi** |
-| HOT HA (replica=1 + запас) | **~600 Gi** → 3× **200 Gi** |
-| ARCHIVE 1 год | 235 × 4.06 × 0.85 ≈ **810 GB** → том **1 Ti** |
-| ARCHIVE 3 года | ≈ **2.4 Ti** |
-
-### 5.3. Сценарий 1000 агентов
-
-| Величина | Значение |
-|---|---|
-| HOT primary 90d | **2.3 Ti** |
-| HOT HA | **~6 Ti** → 3× **2 Ti** |
-| ARCHIVE 1 год | ≈ **8 Ti** (том **8–10 Ti**, лучше HDD/объектное) |
-| ARCHIVE 3 года | ≈ **24 Ti** |
-
----
-
-## 6. Официальный baseline CPU/RAM + K8s
-
-| Компонент | Official recommended | В K8s добавляем |
-|---|---|---|
-| Indexer | 8 CPU / 16 GB | + kubelet/CNI; page cache в cgroup пода; +CP если совмещён |
-| Server | 8 CPU / 4 GB | workers выше по RAM (очереди analysisd) |
-| Dashboard | 4 CPU / 8 GB | + Ingress/MetalLB на ноде |
-
-Сигналы overload manager: `events_dropped` (analysisd), `discarded_count` (remoted) → должны быть **0**.
-
----
-
-## 7. Сценарий A: до 100 агентов (compact + ARCHIVE) — рекомендуемый
-
-### 7.1. Вердикт
-
-**4 Wazuh-пода + ARCHIVE / 4 ВМ / ~24 vCPU / ~64–72 Gi RAM / ~400 Gi HOT SSD + ~1 Ti ARCHIVE**
-
-Схема **рабочая** для production без HA indexer. История >90 дней — **только из ARCHIVE**.
-
-### 7.2. Поды
-
-| Компонент | N | CPU req→lim | RAM req→lim | PVC | Почему |
-|---|---:|---|---|---|---|
-| master | 1 | 1→2 | 2→4 Gi | 50 Gi | authd/API; лёгкий |
-| worker | 1 | 2→4 | 4→8 Gi | 50 Gi | весь `:1514` |
-| indexer | 1 | 2→4 | 12→**24 Gi** | **300 Gi SSD** | heap **8g**; остаток Lucene |
-| dashboard | 1 | 0.5→2 | 1→4 Gi | — | UI |
-| archive | — | вне K8s или Deploy MinIO | см. ВМ | **1 Ti** | снимки |
-
-Не ставить master+worker оба с lim 8 Gi на ВМ 16 Gi.
-
-### 7.3. ВМ
-
-| # | Роль | vCPU | RAM | OS | Data | Поды / сервисы |
+| ВМ | Роль | vCPU | RAM | Диск OS (vmdk) | Диск DATA (vmdk) | Datastore тип |
 |---|---|---:|---:|---:|---:|---|
-| 1 | Indexer (+ K8s CP) | 8 | 32 Gi | 80 Gi | **300 Gi SSD** | indexer-0; `path.repo` → mount ARCHIVE |
-| 2 | Manager | 8 | **24 Gi** | 80 Gi | 100 Gi SSD | master + worker |
-| 3 | Dashboard | 4 | 8 Gi | 60 Gi | — | dashboard, Ingress |
-| 4 | **Archive** | 4 | 8 Gi | 60 Gi | **1 Ti** (SSD или HDD) | NFS server **или** MinIO |
+| `k8s-indexer` | K8s CP + indexer | 8 | 32 Gi | **80 Gi** | **300 Gi** | SSD |
+| `k8s-manager` | master+worker pods | 8 | 24 Gi | **80 Gi** | **100 Gi** | SSD |
+| `k8s-dashboard` | dashboard + Ingress | 4 | 8 Gi | **60 Gi** | — | SSD/any |
+| `wazuh-archive` | NFS snapshots | 4 | 8 Gi | **60 Gi** | **1024 Gi (1 Ti)** | HDD OK |
 
-Почему Archive отдельно: снимки не должны жить на том же диске, что HOT; NFS — путь из [официальной миграции индексов Wazuh](https://documentation.wazuh.com/current/user-manual/wazuh-indexer/migrating-wazuh-indices.html).
+VIP LB (MetalLB/HAProxy): `:1514`, `:1515`, `:443`.  
+Сеть ARCHIVE: только с IP indexer (NFS 2049).
 
-### 7.4. Суммарно (100 compact)
-
-| Метрика | Значение |
-|---|---|
-| ВМ | **4** |
-| vCPU | ~24 |
-| RAM | ~72 Gi |
-| HOT data SSD | ~400 Gi |
-| ARCHIVE | **1 Ti** (1 год) |
-| Рабочесть | **Рабочая** |
-
-### 7.5. HA-вариант 100 (если нужен SLA)
-
-| | Значение |
-|---|---|
-| Поды | 1 master + 2 workers + 3 indexer + 2 dashboard |
-| Indexer ВМ | 3× **8 vCPU** / 16–24 Gi / data **200 Gi** |
-| Archive | 1 ВМ **1–2 Ti** (лучше NFS за всеми indexer) |
-| Итого | ~7 ВМ, ~48 vCPU, ~100 Gi RAM, ~750 Gi HOT + 1–2 Ti ARCHIVE |
+Для **1000 агентов** — §12; ARCHIVE data **8–10 Ti**.
 
 ---
 
-## 8. Сценарий B: до 1000 агентов (HA + ARCHIVE) — рекомендуемый
+## 4. Создание ВМ в ESXi 7 — общие настройки
 
-### 8.1. Вердикт
+Делать для **каждой** ВМ, затем отличия по ролям (§5).
 
-**9 Wazuh-подов / 8 compute ВМ + 1–2 ARCHIVE / ~120+ vCPU / ~304+ Gi / ~6.4 Ti HOT + ~8–10 Ti ARCHIVE**
+### 4.1. Мастер создания ВМ (New Virtual Machine)
 
-Схема **рабочая с запасом**. LB на `:1514` **обязателен**.
+| Параметр | Значение | Почему |
+|---|---|---|
+| Creation type | Create a new virtual machine | — |
+| Name | как в таблице (`k8s-indexer` …) | DNS/hosts |
+| Compatibility | **ESXi 7.0 and later** | аппаратная версия 17+ |
+| Guest OS family | Linux | — |
+| Guest OS version | **Other 4.x or later Linux (64-bit)** или ближайший RHEL/Debian 64-bit | РЕД ОС≈RHEL; Astra≈Debian. Если есть точный профиль — выбрать его |
+| Firmware | **EFI** | современный boot; для Astra/РЕД ОС обычно EFI |
+| Secure Boot | **Disabled** (пока) | проще для kube/NFS; включать только после проверки цепочки |
 
-### 8.2. Поды
+### 4.2. CPU
 
-| Компонент | N | CPU lim | RAM lim | PVC |
+| Параметр | Значение | Почему |
+|---|---|---|
+| CPU | см. роль (§5) | — |
+| Cores per socket | **1** (или = числу vCPU, без NUMA-сюрпризов на малых ВМ) | предсказуемый scheduling |
+| CPU Hot Plug | **Disabled** | стабильность K8s/OpenSearch |
+| Hardware virtualization (VHV/VT-x exposure) | **Disabled** | nested KVM не нужен |
+| Latency Sensitivity | Normal; для indexer можно **High** если лицензия/кластер позволяет | меньше jitter I/O |
+
+Резервация CPU (Reservation): для indexer/manager желательно **≥50%** номинала в production; на archive — не обязательно.
+
+### 4.3. Memory
+
+| Параметр | Значение |
+|---|---|
+| Memory | по роли |
+| Reserve all guest memory (All locked) | **рекомендуется для indexer** (и желательно manager) |
+| Memory Hot Plug | **Disabled** |
+
+Без reservation ESXi при overcommit начнёт ballooning → GC/OOM у indexer.
+
+### 4.4. SCSI / Controllers / Disks
+
+| Параметр | Значение | Почему |
+|---|---|---|
+| SCSI Controller 0 | **VMware Paravirtual (PVSCSI)** | выше IOPS, меньше CPU |
+| Hard disk 1 (OS) | размер по роли, **Thin** или Thick Lazy | ОС |
+| Hard disk 2 (DATA) | размер по роли (если есть) | отдельный vmdk — обязательно отдельно от OS |
+| Disk Provisioning DATA (indexer/manager) | **Thick Provision Eager Zeroed** | стабильный latency для OpenSearch/PVC |
+| Disk Provisioning ARCHIVE data | Thick Lazy или Thin | холодные снимки |
+| Sharing | No sharing | — |
+| Disk Mode | Dependent | обычные snapshots ВМ не путать со snapshot indexer |
+| Controller location | SCSI Controller 0 | оба диска на PVSCSI |
+
+> Не ставить OS+DATA одним диском: проще расширять DATA, проще LVM/mount, меньше риск забить root.
+
+Virtual Device Node: Disk1 = `SCSI(0:0)`, Disk2 = `SCSI(0:1)`.
+
+### 4.5. Network
+
+| Параметр | Значение |
+|---|---|
+| Adapter type | **VMXNET 3** |
+| Network | port group: management/K8s (и отдельный PG для NFS, если сегментируете) |
+| Connect at power on | Yes |
+
+Рекомендация: 2 vNIC на indexer — `eth0` K8s/agents path, `eth1` только к ARCHIVE NFS (опционально, но правильно для ИБ).
+
+### 4.6. Прочее
+
+| Параметр | Значение |
+|---|---|
+| CD/DVD | Datastore ISO ОС, Connect at power on при установке |
+| USB | не нужны |
+| vTPM | по политике ИБ (Astra); для K8s не обязателен |
+| VMware Tools / open-vm-tools | установить **после** ОС |
+| Snapshots ВМ ESXi | **не держать** долго на indexer/manager (портят I/O); бэкап — через archive snapshots OpenSearch + бэкап ВМ по регламенту |
+
+### 4.7. Anti-affinity (если vCenter)
+
+Правила VM/Host: `k8s-indexer`, `k8s-manager`, `k8s-dashboard`, `wazuh-archive` — **на разных ESXi-хостах** по возможности. Два indexer (в HA) — никогда на одном хосте.
+
+---
+
+## 5. ESXi 7 — параметры по ролям (100 агентов)
+
+### 5.1. `k8s-indexer`
+
+| Параметр | Значение |
+|---|---|
+| vCPU | **8** |
+| RAM | **32 Gi**, Reserve all guest memory = **Yes** |
+| Disk1 OS | **80 Gi**, Thin/Lazy |
+| Disk2 DATA | **300 Gi**, **Eager Zeroed**, datastore **SSD** |
+| Latency Sensitivity | High (если доступно) |
+| Сеть | VMXNET3; опционально 2-я NIC к NFS |
+
+### 5.2. `k8s-manager`
+
+| Параметр | Значение |
+|---|---|
+| vCPU | **8** |
+| RAM | **24 Gi**, reservation ≥ 16 Gi |
+| Disk1 OS | **80 Gi** |
+| Disk2 DATA | **100 Gi**, Eager Zeroed, SSD |
+
+### 5.3. `k8s-dashboard`
+
+| Параметр | Значение |
+|---|---|
+| vCPU | **4** |
+| RAM | **8 Gi** |
+| Disk1 OS | **60 Gi** |
+| Disk2 | нет |
+
+### 5.4. `wazuh-archive` (отдельный сервер архивации)
+
+| Параметр | Значение |
+|---|---|
+| vCPU | **4** |
+| RAM | **8 Gi** |
+| Disk1 OS | **60 Gi** |
+| Disk2 DATA | **1024 Gi (1 Ti)**, Thick Lazy/Thin, datastore может быть **HDD** |
+| Сеть | VMXNET3 в том же L2/L3, что indexer (или выделенный NFS VLAN) |
+| Роль | **только NFS-сервер** (не член K8s) |
+| Snapshots ESXi этой ВМ | по регламенту бэкапа (отдельно от OpenSearch snapshots) |
+
+Почему отдельная ВМ: снимки индексов не должны жить на том же SSD/datastore, что HOT; потеря datastore indexer не должна стереть ARCHIVE.
+
+---
+
+## 6. Разделы при установке ОС
+
+Правило: **swap не использовать** (K8s требует swapoff). На ARCHIVE swap тоже не нужен.
+
+Схема ниже — для **ручной разметки** (Custom / Manual partitioning). Имена дисков: `sda` = OS vmdk, `sdb` = DATA vmdk (в ESXi могут быть `nvme0n1` — смотрите `lsblk`).
+
+### 6.1. Общий шаблон OS-диска (`sda`, GPT + EFI)
+
+| Точка монтирования | Размер | FS | Диск | Примечание |
 |---|---:|---|---|---|
-| master | 1 | 8 | 16 Gi | 100 Gi |
-| worker | **3** | 8 | 16 Gi | 100 Gi each |
-| indexer | **3** | 8–16 | **40–48 Gi** (heap 16g) | **2 Ti** each |
-| dashboard | **2** | 2 | 4 Gi | — |
+| `/boot/efi` | **600 MiB** | vfat (EFI System) | sda | обязательно при EFI |
+| `/boot` | **1 GiB** | xfs (РЕД ОС) / ext4 (Astra) | sda | ядра |
+| `/` | **остаток OS-диска** | xfs / ext4 | sda | root+var+usr |
+| swap | **не создавать** | — | — | после установки `swapoff -a` |
 
-### 8.3. ВМ
+Размеры OS-дисков:
 
-| # | Роль | vCPU | RAM | OS | Data |
-|---|---|---:|---:|---:|---:|
-| 1–3 | Indexer | 16 | 64 Gi | 120 Gi | **2 Ti SSD** (+ mount NFS repo) |
-| 4 | Master | 16 | 32 Gi | 100 Gi | 100 Gi |
-| 5–7 | Worker | 16 | 32 Gi | 100 Gi | 100 Gi |
-| 8 | Dashboard | 8 | 16 Gi | 100 Gi | — |
-| 9 | **Archive NFS/MinIO** | 8 | 16 Gi | 100 Gi | **8–10 Ti** (HDD OK для холодного) |
-| 9b (opt) | Archive replica | 8 | 16 Gi | 100 Gi | зеркало/replication MinIO |
+| ВМ | OS vmdk | ≈ под `/` после EFI+boot |
+|---|---:|---:|
+| indexer / manager | 80 Gi | ~78 Gi |
+| dashboard / archive | 60 Gi | ~58 Gi |
 
-Master/worker 16/32 — conservative (official server 8/4); резать только под метриками дропов.
+### 6.2. DATA-диск (`sdb`) — не в LVM с root
 
-### 8.4. Суммарно
+В установщике ОС: **не размечать sdb** (оставить пустым) **или** сразу одна partition + mount — проще разметить **после** установки (см. install). Архитектурно целевые mount:
 
-| Метрика | Значение |
-|---|---|
-| Compute ВМ | 8 |
-| Archive ВМ | 1–2 |
-| HOT SSD | ~6.4 Ti |
-| ARCHIVE | **8–10 Ti** (1 год) |
-| Рабочесть | **Рабочая HA** |
+| ВМ | Устройство | Размер | FS | Mount | Содержимое |
+|---|---|---:|---|---|---|
+| k8s-indexer | sdb1 | 300 Gi | **xfs** (РЕД) / **ext4** (Astra) | `/data/wazuh` | PVC indexer (`.../indexer`) |
+| k8s-manager | sdb1 | 100 Gi | xfs/ext4 | `/data/wazuh` | `manager-master`, `manager-worker` |
+| k8s-dashboard | — | — | — | — | — |
+| wazuh-archive | sdb1 | **1 Ti** | xfs/ext4 | `/mnt/snapshots` | NFS export = snapshot repo |
+
+Подкаталоги на indexer/manager после монтирования:
+
+```
+/data/wazuh/indexer
+/data/wazuh/manager-master
+/data/wazuh/manager-worker
+```
+
+### 6.3. РЕД ОС 8 vs Astra — отличия разметки
+
+| | РЕД ОС 8 | Astra SE 1.7 / 1.8 |
+|---|---|---|
+| Установщик | Anaconda (как RHEL) | свой graphical/text (Debian-like) |
+| FS по умолчанию | **xfs** на `/` и data | **ext4** |
+| LVM | можно на `/`, но data лучше **без LVM** (простой partition) | то же |
+| MAC/ЗПС | SELinux | согласовать исключения для K8s/NFS |
+
+### 6.4. Почему так
+
+- Отдельный DATA → расширение vmdk в ESXi без переразметки root.
+- Eager Zeroed + xfs/ext4 noatime → предсказуемый I/O indexer.
+- Нет swap → kubelet не конфликтует.
+- ARCHIVE на отдельном mount `/mnt/snapshots` → совпадает с официальным `path.repo`.
 
 ---
 
-## 9. Сеть
+## 7. Компоненты Wazuh / K8s
 
-| Порт | Назначение |
+| Компонент | Kind | Порты |
+|---|---|---|
+| manager-master ×1 | STS | 1515, 55000, 1516 |
+| manager-worker ×N | STS | 1514 → Filebeat → 9200 |
+| indexer ×M | STS | 9200, 9300 + mount NFS repo |
+| dashboard ×K | Deploy | 443 |
+| **wazuh-archive** | ВМ NFS | 2049 (не pod) |
+
+Поды 100 compact: master lim 2CPU/4Gi; worker 4/8; indexer 4/24 heap 8g PVC 300Gi; dashboard 2/4.
+
+---
+
+## 8. Сервер архивации — логика и настройки
+
+### 8.1. Назначение
+
+Хранить **OpenSearch/Wazuh indexer snapshots** (не «сырые» логи агентов). Это сжатые снимки индексов `wazuh-alerts-*` (+ cluster state).
+
+### 8.2. ПО на ВМ
+
+- ОС: та же линейка (РЕД ОС 8 или Astra)
+- Пакеты: `nfs-utils` / `nfs-kernel-server`
+- Службы: `nfs-server`, firewall только с сети indexer
+- Export: `/mnt/snapshots` → CIDR indexer(ов)
+- Опции export: `rw,sync,no_root_squash,no_subtree_check` (как в доке Wazuh; `no_root_squash` нужен для uid процесса indexer в контейнере — зафиксировать UID, обычно 1000)
+- chrony обязателен (иначе расхождение времени ломает политики)
+
+### 8.3. Ежедневная архивация — как сделать
+
+1. На indexer: `path.repo: ["/mnt/snapshots"]`, NFS смонтирован с archive.
+2. Зарегистрировать repository `wazuh-archive-repo` (type: shared file system).
+3. **Snapshot Management Policy** (Dashboard или API):
+   - schedule: `0 2 * * *` (каждый день 02:00);
+   - indices: `wazuh-alerts-*`;
+   - include cluster state: yes;
+   - retention снимков: **365d** (удалять snapshot старше года на ARCHIVE).
+4. Мониторинг: алерт, если >36 часов нет `SUCCESS`.
+5. ISM на `wazuh-alerts-*`: `min_index_age: 90d` → `delete` (включать **после** обкатки снимков 7–14 дней).
+
+Итог: каждый день на ARCHIVE появляются/обновляются снимки; через 90 дней HOT чистится; год истории лежит на NFS.
+
+### 8.4. Как потом «достать и смотреть» в Wazuh
+
+Снимки **не видны** в Discover, пока лежат только на NFS.
+
+Пошагово:
+
+1. Wazuh Dashboard → ☰ → **Indexer management** → **Snapshot Management** → **Snapshots**.
+2. Найти снимок за нужную дату (или содержащий нужный `wazuh-alerts-YYYY.MM.DD`).
+3. **Restore** → выбрать индексы → убрать конфликтующий prefix при необходимости.
+4. Дождаться зелёного статуса индекса (`_cat/indices`).
+5. **Discover** / **Threat Hunting** / **Security events** — выбрать index pattern `wazuh-alerts-*` и диапазон дат восстановленного периода.
+6. После расследования: **удалить** восстановленный индекс с HOT (чтобы не забить 300 Gi).
+7. Данные на ARCHIVE при этом **остаются** (пока не истечёт retention снимков).
+
+Ограничения:
+
+- Restore требует свободное место на HOT SSD (оценка ≈ размер индекса + запас).
+- Нельзя «подключить ARCHIVE как read-only searchable» без restore (для searchable snapshots нужен другой класс хранилища/лицензий OpenSearch — в этом плане не используем).
+
+### 8.5. Резервное копирование самого ARCHIVE
+
+Раз в неделю: бэкап ВМ archive или `rsync`/`borg` каталога `/mnt/snapshots` на второй СХД. Иначе одна ВМ archive = SPOF истории.
+
+---
+
+## 9. Расчёт дисков HOT / ARCHIVE
+
+```
+HOT_primary_90d = N_ws×1.5 + N_srv×3.7 + N_net×7.4
+HOT_single      = HOT_primary_90d × 1.25
+ARCHIVE_1y      ≈ HOT_primary_90d × (365/90) × 0.85
+```
+
+| Сценарий | HOT primary | HOT PVC | ARCHIVE 1 год |
+|---|---:|---:|---:|
+| 100 агентов | 235 GB | **300 Gi** | **~1 Ti** |
+| 1000 агентов | 2.3 Ti | 3×**2 Ti** | **~8–10 Ti** |
+
+---
+
+## 10. Сеть и порты
+
+| Порт | Куда |
 |---:|---|
-| 1514 | LB → workers (events) |
-| 1515 | LB → master (enrollment) |
-| 1516 | cluster internal |
-| 55000 | API internal |
-| 9200/9300 | indexer |
+| 1514 | LB → workers |
+| 1515 | LB → master |
 | 443 | UI |
-| 2049 | NFS ARCHIVE ← indexer nodes |
-| 9000 | MinIO API (если S3) |
-
-Firewall: агентские сети только на VIP 1514/1515/443; ARCHIVE — только с indexer CIDR.
+| 6443 | K8s API |
+| 2049 | ARCHIVE NFS ← только indexer |
+| 9200/9300/1516/55000 | internal |
 
 ---
 
-## 10. Когда масштабировать
+## 11. Когда масштабировать
 
 | Сигнал | Действие |
 |---|---|
-| `events_dropped` / `discarded_count` > 0 | +worker |
-| HOT disk >70% | расширить PVC **или** проверить, что ISM delete реально работает |
-| Snapshot fail | чинить ARCHIVE/NFS до заполнения HOT |
-| ARCHIVE >80% | расширить том или снизить `ARCHIVE_YEARS` / чистить старые снимки |
-| Search latency / heap >75% | RAM/CPU indexer; heap ≤32g |
-| Агенты ≫ текущего сценария | пересмотр по таблице сравнения |
+| `events_dropped` / `discarded_count` > 0 | +worker (+ВМ) |
+| HOT >70% | PVC↑ или проверить ISM |
+| Snapshot FAIL | чинить NFS/archive немедленно |
+| ARCHIVE >80% | расширить vmdk 1 Ti / чистить старые snapshots |
+| Нужен HA | 3 indexer + 2 workers + anti-affinity ESXi |
 
 ---
 
-## 11. Сравнение
+## 12. Сценарий 1000 агентов (кратко)
 
-| | 100 compact+archive | 100 HA+archive | 1000 HA+archive |
-|---|---|---|---|
-| Wazuh-поды | 4 | 8 | 9 |
-| Compute ВМ | 3 | ~6 | 8 |
-| Archive ВМ | **1** | **1** | **1–2** |
-| HOT | ~400 Gi | ~750 Gi | ~6.4 Ti |
-| ARCHIVE (1г) | **~1 Ti** | **~1–2 Ti** | **~8–10 Ti** |
-| После 90 дней | снимок → delete HOT | то же | то же |
-| LB :1514 | желателен | да | **обязателен** |
-| Оценка | **рабочая** | **рабочая** | **рабочая с запасом** |
+| ВМ | vCPU / RAM | OS / DATA vmdk |
+|---|---|---|
+| Indexer ×3 | 16 / 64 | 120 Gi / **2 Ti SSD** Eager Zeroed |
+| Master ×1 | 16 / 32 | 100 / 100 |
+| Worker ×3 | 16 / 32 | 100 / 100 |
+| Dashboard ×1 | 8 / 16 | 100 / — |
+| Archive ×1 | 8 / 16 | 100 / **8–10 Ti** |
+| LB :1514 | обязателен | — |
+
+Разделы ОС — тот же шаблон §6; DATA mount тот же. NFS export монтируется на **каждый** indexer.
 
 ---
 
-## 12. Чеклист принятия архитектуры
+## 13. Сводка «рабочесть»
 
-- [ ] Зафиксирован контракт: HOT 90d + ARCHIVE ≥1 год (или явное «удалять навсегда» — тогда Archive ВМ не нужна, но это другое решение)
-- [ ] Archive не на том же диске, что indexer PVC
-- [ ] Ежедневный snapshot + мониторинг успеха
-- [ ] ISM delete не опережает успешный снимок
-- [ ] Процедура Restore документирована и проверена на стенде
-- [ ] `wazuh-archives-*` выключен, если не считали отдельный диск
-- [ ] SSD только на HOT; ARCHIVE допускается HDD/объектное
+| Контур | Оценка |
+|---|---|
+| 100 + ESXi + ARCHIVE | **Рабочая production** |
+| Без ARCHIVE при retention 90d | **Неприемлемо** (потеря данных) |
+| 1000 HA + ARCHIVE | **Рабочая с запасом** |
 
-Установка и настройка пошагово: [wazuh-install.md](wazuh-install.md).
+---
+
+## 14. Чеклист архитектуры
+
+- [ ] 4 ВМ созданы в ESXi 7 с параметрами §4–§5
+- [ ] PVSCSI, VMXNET3, EFI, DATA отдельным vmdk Eager Zeroed (HOT)
+- [ ] Разделы: EFI+boot+/, без swap; DATA → `/data/wazuh` или `/mnt/snapshots`
+- [ ] Archive вне K8s, NFS только для indexer
+- [ ] Daily snapshot 02:00 + retention 365d
+- [ ] ISM 90d delete после обкатки снимков
+- [ ] Процедура Restore → просмотр в Dashboard отработана
+- [ ] Бэкап самой ВМ archive
+
+Далее: [wazuh-install.md](wazuh-install.md).
