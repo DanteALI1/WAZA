@@ -153,7 +153,7 @@ Replica=1 на 3 нодах → данные ~600 Gi кластера распр
 | 5–7 | Manager-worker ×3 | 16 | 32 Gi | 100 Gi | 100 Gi | 1× worker на ВМ |
 | 8 | Dashboard | 8 | 16 Gi | 100 Gi | — | 2× dashboard |
 
-Почему 64 Gi на indexer-ВМ: pod 32 Gi + OS/kubelet + file cache под 2 Ti SSD критичен для IOPS-латентности поиска.
+Почему 64 Gi на indexer-ВМ: pod лучше 40–48 Gi (heap 16g + Lucene в cgroup) + OS/kubelet; file cache на 2 Ti SSD критичен для латентности поиска. Official recommended 8 CPU/16 GB — пол для малой ноды, не потолок для 2 Ti.
 
 ### 4) Суммарные ресурсы
 
