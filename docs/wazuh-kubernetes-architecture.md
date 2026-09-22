@@ -45,7 +45,7 @@ Production-oriented план для двух сценариев: **до 100 аг
 
 ### 1) Вердикт (компактный, рекомендуемый)
 
-**4 пода / 3 ВМ / ~20 vCPU / ~56 Gi RAM / ~400 Gi data SSD**
+**4 пода / 3 ВМ / ~20 vCPU / ~56–64 Gi RAM / ~400 Gi data SSD** — схема **рабочая** для production без HA.
 
 Оценка данных: ~235 GB primary → ~470 GB (replica=1) → ~600 GB с запасом; для single-indexer достаточно **~300 Gi PVC**.
 
@@ -53,22 +53,24 @@ Production-oriented план для двух сценариев: **до 100 аг
 
 | Компонент | Кол-во | CPU req→lim | RAM req→lim | PVC | Почему |
 |---|---:|---|---|---|---|
-| `wazuh-manager-master` | 1 | 2→4 | 4→8 Gi | 50 Gi | authd `:1515`, API `:55000`, cluster `:1516`; единственный master |
+| `wazuh-manager-master` | 1 | 1→2 | 2→4 Gi | 50 Gi | authd `:1515`, API `:55000`, cluster `:1516`; enrollment лёгкий; не забирает всю RAM ВМ |
 | `wazuh-manager-worker` | 1 | 2→4 | 4→8 Gi | 50 Gi | события агентов `:1514`, analysisd, Filebeat→indexer |
-| `wazuh-indexer` | 1 | 2→4 | 8→16 Gi | **300 Gi SSD** | хранение/поиск; heap `-Xms8g -Xmx8g` (½ RAM) |
-| `wazuh-dashboard` | 1 | 0.5→1 | 1→2 Gi | — | UI `:443` → indexer + manager API |
+| `wazuh-indexer` | 1 | 2→4 | 12→**24 Gi** | **300 Gi SSD** | хранение/поиск; heap `-Xms8g -Xmx8g`; остаток cgroup — Lucene/page cache |
+| `wazuh-dashboard` | 1 | 0.5→2 | 1→4 Gi | — | UI `:443`; official recommended dashboard = 4 CPU / 8 GB на ноду |
 
 **Итого подов: 4.** Anti-affinity: indexer и managers на разных ВМ; на 3 ВМ worker и master соседствуют на одной manager-ноде — приемлемо для compact.
+
+> Перепроверка и «почему столько»: [wazuh-sizing-review.md](wazuh-sizing-review.md). Диск 300 Gi = 235 GB primary ×1.25 (single-node без replica).
 
 ### 3) Раскладка ВМ
 
 | # | Роль ВМ | vCPU | RAM | OS disk | Data disk | Поды |
 |---|---|---:|---:|---:|---:|---|
-| 1 | Indexer | 8 | 32 Gi | 80 Gi | **300 Gi SSD** | 1× indexer |
-| 2 | Manager | 8 | 16 Gi | 80 Gi | **100 Gi SSD** (2×50 Gi PVC) | 1× master + 1× worker |
+| 1 | Indexer (+ K8s CP) | 8 | 32 Gi | 80 Gi | **300 Gi SSD** | 1× indexer |
+| 2 | Manager | 8 | **16–24 Gi** | 80 Gi | **100 Gi SSD** (2×50 Gi PVC) | 1× master + 1× worker |
 | 3 | Dashboard | 4 | 8 Gi | 60 Gi | — | 1× dashboard |
 
-Почему 32 Gi на indexer-ВМ при лимите пода 16 Gi: запас под OS, kubelet, page cache OpenSearch и всплески merge/refresh.
+Почему indexer-ВМ 32 Gi: official indexer recommended = 16 GB **плюс** control-plane/kubelet на той же ноде в compact. Pod лучше 20–24 Gi (не 16), чтобы page cache жил в cgroup. Manager 16 Gi рабочий **только если** master limits ≤4 Gi; иначе взять **24 Gi**.
 
 ### 4) Суммарные ресурсы
 
@@ -76,9 +78,10 @@ Production-oriented план для двух сценариев: **до 100 аг
 |---|---|
 | ВМ | 3 |
 | vCPU | 20 |
-| RAM | 56 Gi |
+| RAM | **56–64 Gi** (16 или 24 Gi на manager-ВМ) |
 | OS disks | ~220 Gi |
 | Data SSD | ~400 Gi |
+| Оценка схемы | **Рабочая** (без HA данных); см. [sizing-review](wazuh-sizing-review.md) |
 
 ### 5) Сеть / порты / LB
 
@@ -113,10 +116,10 @@ Production-oriented план для двух сценариев: **до 100 аг
 | | Значение |
 |---|---|
 | Поды | 1 master + **2** workers + **3** indexer + **2** dashboard = **8** |
-| Indexer ВМ | 3× (4 vCPU / 16 Gi / data **200 Gi** SSD), 1 pod/ВМ; heap 8g |
+| Indexer ВМ | 3× (**8** vCPU / 16–24 Gi / data **200 Gi** SSD), 1 pod/ВМ; heap 8g — **не 4 vCPU** (official recommended = 8 CPU) |
 | Manager | отдельная ВМ или 2 ВМ под master+workers |
 | Dashboard | 2 replica (на одной или двух ВМ) |
-| **Итого ~** | **6 ВМ, ~28 vCPU, ~80 Gi RAM, ~750 Gi data SSD** |
+| **Итого ~** | **6 ВМ, ~40 vCPU, ~80–100 Gi RAM, ~750 Gi data SSD** |
 
 Replica=1 на 3 нодах → данные ~600 Gi кластера распределяются; 3×200 Gi с запасом.
 
@@ -136,7 +139,7 @@ Replica=1 на 3 нодах → данные ~600 Gi кластера распр
 |---|---:|---|---|---|---|
 | `wazuh-manager-master` | 1 | 4→8 | 8→16 Gi | 100 Gi | authd, API, cluster; без приёма массовых events |
 | `wazuh-manager-worker` | **3** | 4→8 | 8→16 Gi | 100 Gi каждый | горизонтальное масштабирование анализа; ~300–350 агентов/worker с запасом |
-| `wazuh-indexer` | **3** | 4→**8–16** | 16→**32 Gi** | **2 Ti SSD** каждый | shard distribution + replica; heap **16g** (`-Xms16g -Xmx16g`) |
+| `wazuh-indexer` | **3** | 4→**8–16** | 24→**40–48 Gi** (лимит; heap **16g**) | **2 Ti SSD** каждый | shard + replica; heap 16g, остаток cgroup — Lucene; ВМ 64 Gi |
 | `wazuh-dashboard` | **2** | 1→2 | 2→4 Gi | — | HA UI за Ingress |
 
 **Итого подов: 9.** Hard anti-affinity для indexer (1 pod / 1 ВМ). Soft/hard anti-affinity для manager-подов — каждый на своей ВМ.
@@ -150,7 +153,7 @@ Replica=1 на 3 нодах → данные ~600 Gi кластера распр
 | 5–7 | Manager-worker ×3 | 16 | 32 Gi | 100 Gi | 100 Gi | 1× worker на ВМ |
 | 8 | Dashboard | 8 | 16 Gi | 100 Gi | — | 2× dashboard |
 
-Почему 64 Gi на indexer-ВМ: pod 32 Gi + OS/kubelet + file cache под 2 Ti SSD критичен для IOPS-латентности поиска.
+Почему 64 Gi на indexer-ВМ: pod лучше 40–48 Gi (heap 16g + Lucene в cgroup) + OS/kubelet; file cache на 2 Ti SSD критичен для латентности поиска. Official recommended 8 CPU/16 GB — пол для малой ноды, не потолок для 2 Ti.
 
 ### 4) Суммарные ресурсы
 
@@ -207,13 +210,16 @@ Replica=1 на 3 нодах → данные ~600 Gi кластера распр
 |---|---|---|---|
 | Поды | 4 (1+1+1+1) | 8 (1+2+3+2) | **9 (1+3+3+2)** |
 | ВМ | **3** | ~6 | **8** |
-| vCPU | **~20** | ~28 | **~120** |
-| RAM | **~56 Gi** | ~80 Gi | **~304 Gi** |
+| vCPU | **~20** | ~40 | **~120** |
+| RAM | **~56–64 Gi** | ~80–100 Gi | **~304 Gi** |
 | Data SSD | **~400 Gi** | ~750 Gi | **~6.4 Ti** |
 | Indexer PVC | 1×300 Gi | 3×200 Gi | 3×2 Ti |
 | Workers | 1 | 2 | 3 |
 | LB `:1514` | желателен | да | **обязателен** |
+| Рабочесть схемы | **рабочая** (подкрутить manager limits) | **рабочая** (indexer ≥8 vCPU) | **рабочая с запасом** |
 | Рекомендация | **compact** | при SLA | **HA** |
+
+Подробный разбор «почему столько на каждую ВМ»: [wazuh-sizing-review.md](wazuh-sizing-review.md).
 
 ### Инварианты обоих сценариев
 
