@@ -10,11 +10,25 @@
 
 1. Создать ВМ в ESXi 7  
 2. Установить ОС с нужной разметкой  
-3. Подготовить ОС (РЕД / Astra)  
+3. **Bootstrap-скрипты** — подготовка ОС до K8s/Wazuh ([scripts/bootstrap](../scripts/bootstrap/README.md))  
 4. Поднять K8s + Wazuh  
-5. Настроить сервер ARCHIVE + ежедневные снимки + ISM  
-6. Научиться Restore и просмотру в Dashboard  
+5. Настроить ARCHIVE snapshots + ISM (если NFS ещё не поднят скриптом archive)  
+6. Restore и просмотр в Dashboard  
 7. Подключить агентов  
+
+### Bootstrap (этап 3) — скрипты по ВМ
+
+После установки ОС скопируйте `scripts/bootstrap` на хост и выполните **от root**:
+
+| ВМ | Команда |
+|---|---|
+| k8s-indexer | `sudo ./bootstrap-k8s-indexer.sh` |
+| k8s-manager | `sudo ./bootstrap-k8s-manager.sh` |
+| k8s-dashboard | `sudo ./bootstrap-k8s-dashboard.sh` |
+| wazuh-archive | `sudo ./bootstrap-wazuh-archive.sh` |
+
+Скрипты пишут отчёт/DEBUG в `/var/log/wazuh-bootstrap/`; на каждом этапе логируют, что сделали; при ошибке — код возврата и хвост вывода; **спрашивают** перед firewall, mkfs DATA-диска, SELinux Permissive, записью `/etc/hosts`; создают пользователей `wazuhadmin` / `wazuhops` и sudoers с разграничением.  
+Подробности: [scripts/bootstrap/README.md](../scripts/bootstrap/README.md).
 
 ---
 

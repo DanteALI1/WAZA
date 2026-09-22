@@ -6,6 +6,7 @@ Production-контур Wazuh в Kubernetes на **VMware ESXi 7**.
 
 1. [Архитектура](docs/wazuh-architecture.md) — ВМ и параметры ESXi 7, разметка разделов ОС, HOT 90 дней, отдельный сервер ARCHIVE, ежедневные снимки, Restore и просмотр в Dashboard, sizing 100/1000 агентов.
 2. [Установка и настройка](docs/wazuh-install.md) — от создания ВМ в ESXi до агентов: РЕД ОС 8, Astra SE 1.7/1.8, K8s, Wazuh, NFS-архив, daily snapshot, ISM, процедура просмотра архива.
+3. [Bootstrap-скрипты ВМ](scripts/bootstrap/README.md) — подготовка каждой ВМ **до** K8s/Wazuh: пакеты, диски, пользователи/sudo, firewall с подтверждением, NFS, отчёт и DEBUG.
 
 ## Данные после 90 дней
 
