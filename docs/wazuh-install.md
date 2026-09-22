@@ -1,62 +1,138 @@
-# Установка и настройка Wazuh в Kubernetes
+# Установка и настройка Wazuh (ESXi 7 + K8s + ARCHIVE)
 
-Полная поэтапная инструкция для сценария **до 100 агентов** (compact + ARCHIVE), с отдельными шагами ОС:
+Сценарий **до 100 агентов** (compact). ОС гостя: **РЕД ОС 8** / **Astra Linux SE 1.7** / **Astra Linux SE 1.8**.
 
-- **РЕД ОС 8**
-- **Astra Linux SE 1.7**
-- **Astra Linux SE 1.8**
+Архитектура (ESXi, разделы, жизненный цикл данных): [wazuh-architecture.md](wazuh-architecture.md).
 
-Архитектура и жизненный цикл данных (90 дней → архив): [wazuh-architecture.md](wazuh-architecture.md).
+Версия манифестов: `wazuh-kubernetes` **v4.14.7**.
 
-Манифесты: `wazuh-kubernetes` **v4.14.7**. В закрытом контуре все URL замените на зеркала/офлайн-пакеты.
+Порядок работ:
+
+1. Создать ВМ в ESXi 7  
+2. Установить ОС с нужной разметкой  
+3. Подготовить ОС (РЕД / Astra)  
+4. Поднять K8s + Wazuh  
+5. Настроить сервер ARCHIVE + ежедневные снимки + ISM  
+6. Научиться Restore и просмотру в Dashboard  
+7. Подключить агентов  
 
 ---
 
-## 0. Что получите в итоге
-
-| Параметр | Значение |
-|---|---|
-| Поды Wazuh | 1 master + 1 worker + 1 indexer + 1 dashboard |
-| ВМ | 4: indexer(+CP), manager, dashboard, **archive** |
-| HOT | алерты **90 дней** online на SSD |
-| ARCHIVE | снимки **≥ 1 год** на NFS (или MinIO) |
-| После 90 дней | индекс уходит из HOT **только после** успешного снимка → дальше Restore при необходимости |
-
-**Без шагов ARCHIVE (часть F) через 90 дней данные просто удаляются.**
-
-IP в примерах (замените):
+## 0. Адреса (замените на свои)
 
 | Хост | IP |
 |---|---|
-| `k8s-indexer` | 10.10.10.11 |
-| `k8s-manager` | 10.10.10.12 |
-| `k8s-dashboard` | 10.10.10.13 |
-| `wazuh-archive` | 10.10.10.14 |
-| VIP LB | 10.10.10.20 |
+| k8s-indexer | 10.10.10.11 |
+| k8s-manager | 10.10.10.12 |
+| k8s-dashboard | 10.10.10.13 |
+| wazuh-archive | 10.10.10.14 |
+| VIP (MetalLB/HAProxy) | 10.10.10.20 |
+| Сеть NFS/K8s | 10.10.10.0/24 |
 
 ---
 
-## 1. Целевые ресурсы ВМ
+# Часть 1. Создание ВМ в ESXi 7
 
-| ВМ | vCPU | RAM | OS | Data | Назначение |
-|---|---:|---:|---:|---:|---|
-| k8s-indexer | 8 | 32 Gi | 80 Gi | **300 Gi SSD** | indexer + control-plane; mount NFS `/mnt/snapshots` |
-| k8s-manager | 8 | **24 Gi** | 80 Gi | 100 Gi SSD | master + worker |
-| k8s-dashboard | 4 | 8 Gi | 60 Gi | — | dashboard + Ingress |
-| wazuh-archive | 4 | 8 Gi | 60 Gi | **1 Ti** | NFS server (рекомендуется) или MinIO |
+Для каждой ВМ: **Host** → **Create/Register VM** → **Create a new virtual machine**.
 
-Метки K8s: `role=indexer|manager|dashboard`.
+## 1.1. Общие поля мастера
+
+| Шаг | Параметр | Значение |
+|---|---|---|
+| Name | имя | `k8s-indexer` / `k8s-manager` / `k8s-dashboard` / `wazuh-archive` |
+| Compatibility | | **ESXi 7.0 and later** |
+| Guest OS | Family | Linux |
+| Guest OS | Version | Other 4.x or later Linux (64-bit) **или** RHEL 8 / Debian 10–12 64-bit |
+| Firmware (Customize hardware → VM Options → Boot Options) | | **EFI** |
+| Secure Boot | | **Off** |
+
+## 1.2. Customize hardware — шаблон
+
+| Устройство | Настройка |
+|---|---|
+| CPU | по таблице ниже; Cores per Socket = 1; CPU Hot Plug = **Off**; Hardware virtualization = **Off** |
+| Memory | по таблице; для indexer: **Reserve all guest memory** = Yes; Memory Hot Plug = **Off** |
+| SCSI Controller 0 | **VMware Paravirtual** |
+| Hard disk 1 | OS, node `SCSI(0:0)`, Thin или Thick Lazy Zeroed |
+| Hard disk 2 | DATA (если нужен), node `SCSI(0:1)`, для indexer/manager: **Thick Provision Eager Zeroed** |
+| Network adapter 1 | **VMXNET 3**, нужный port group, Connect = Yes |
+| CD/DVD | Datastore ISO нужной ОС, Connect at power on |
+
+## 1.3. Ресурсы по ВМ
+
+| VM | vCPU | RAM | Disk1 OS | Disk2 DATA | Eager Zeroed DATA | Datastore DATA |
+|---|---:|---:|---:|---:|---|---|
+| k8s-indexer | 8 | 32 Gi (reserve all) | 80 Gi | **300 Gi** | Yes | **SSD** |
+| k8s-manager | 8 | 24 Gi | 80 Gi | **100 Gi** | Yes | SSD |
+| k8s-dashboard | 4 | 8 Gi | 60 Gi | — | — | any |
+| wazuh-archive | 4 | 8 Gi | 60 Gi | **1024 Gi** | Lazy/Thin OK | HDD OK |
+
+Создайте все 4 ВМ, подключите ISO, включите питание.
 
 ---
 
-# Часть A. РЕД ОС 8 — подготовка нод K8s
+# Часть 2. Разметка дисков при установке ОС
 
-Выполнять на `k8s-indexer`, `k8s-manager`, `k8s-dashboard` (не на archive — ему NFS, часть F).
+## 2.1. Принципы
 
-### A1. Hostname и hosts
+- Таблица разделов: **GPT**, загрузка **EFI**
+- **Swap не создавать**
+- Диск OS (`sda`): только система
+- Диск DATA (`sdb`): **не смешивать** с root; разметить после установки или одной partition в installer
+
+## 2.2. OS-диск (`sda`) — все ВМ
+
+| Mount | Размер | FS РЕД ОС 8 | FS Astra | Flags |
+|---|---:|---|---|---|
+| `/boot/efi` | 600 MiB | EFI System (vfat) | EFI System (vfat) | esp |
+| `/boot` | 1 GiB | xfs | ext4 | — |
+| `/` | всё оставшееся от OS-диска | xfs | ext4 | — |
+| swap | **нет** | — | — | — |
+
+| ВМ | OS диск | ≈ размер `/` |
+|---|---:|---:|
+| indexer, manager | 80 Gi | ~78 Gi |
+| dashboard, archive | 60 Gi | ~58 Gi |
+
+### РЕД ОС 8 (Anaconda)
+
+Installation Destination → **Custom** → Standard Partition (или LVM **только** для `/`, EFI и boot — стандартные partition):
+
+1. Создать на `sda`: `/boot/efi` 600 MiB, `/boot` 1 GiB, `/` rest, xfs, **без swap**.
+2. Диск `sdb` — **Leave as is** (разметим после).
+
+### Astra SE 1.7 / 1.8
+
+В разметке вручную (Guided — лучше не использовать «весь диск в один раздел», если видит оба диска):
+
+1. На OS-диске: EFI 600M, `/boot` 1G ext4, `/` rest ext4, без swap.
+2. DATA-диск пока не трогать (или сразу одна primary + mount — тогда сразу укажите точки из §2.3).
+
+## 2.3. DATA-диск — целевое состояние после ОС
+
+Выполнить после первого входа (команды ниже в частях 3–4). Итог:
+
+| ВМ | Partition | FS | Mount | Каталоги |
+|---|---|---|---|---|
+| k8s-indexer | `/dev/sdb1` 300 Gi | xfs/ext4 | `/data/wazuh` | `indexer/` (+ позже NFS `/mnt/snapshots`) |
+| k8s-manager | `/dev/sdb1` 100 Gi | xfs/ext4 | `/data/wazuh` | `manager-master/`, `manager-worker/` |
+| k8s-dashboard | нет | — | — | — |
+| wazuh-archive | `/dev/sdb1` 1 Ti | xfs/ext4 | `/mnt/snapshots` | содержимое NFS export |
+
+Добить установку ОС: timezone, root/ssh key, сеть static IP из таблицы §0, hostname.
+
+Установить **open-vm-tools** (РЕД: `dnf install open-vm-tools`; Astra: `apt install open-vm-tools`).
+
+---
+
+# Часть 3. РЕД ОС 8 — post-install на нодах K8s
+
+На `k8s-indexer`, `k8s-manager`, `k8s-dashboard` (archive — часть 6).
+
+## 3.1. Имя и hosts
 
 ```bash
-hostnamectl set-hostname k8s-indexer   # своё имя на каждой
+hostnamectl set-hostname k8s-indexer   # своё имя
 
 cat >/etc/hosts <<'EOF'
 127.0.0.1 localhost
@@ -67,19 +143,20 @@ cat >/etc/hosts <<'EOF'
 EOF
 ```
 
-### A2. Пакеты, время, swap
+## 3.2. Пакеты, время, swap off
 
 ```bash
 dnf -y update
 dnf -y install curl wget tar git chrony yum-utils device-mapper-persistent-data \
   lvm2 ca-certificates conntrack-tools iptables iproute-tc socat ebtables ethtool \
-  nfs-utils openssl
-systemctl enable --now chronyd
+  nfs-utils openssl open-vm-tools
+systemctl enable --now chronyd vmtoolsd
 swapoff -a
 sed -ri 's/.*swap.*/#&/' /etc/fstab
+free -h   # Swap = 0
 ```
 
-### A3. Модули и sysctl (обязателен max_map_count)
+## 3.3. sysctl / modules
 
 ```bash
 cat >/etc/modules-load.d/k8s.conf <<'EOF'
@@ -99,60 +176,44 @@ EOF
 sysctl --system
 ```
 
-### A4. SELinux и firewalld
+## 3.4. firewalld
 
 ```bash
-getenforce   # Enforcing допустим; при CreateContainerError — смотреть audit
-
 systemctl enable --now firewalld
-firewall-cmd --permanent --add-port=6443/tcp
+firewall-cmd --permanent --add-port={6443,10250,179,1514,1515,443}/tcp
 firewall-cmd --permanent --add-port=2379-2380/tcp
-firewall-cmd --permanent --add-port=10250/tcp
-firewall-cmd --permanent --add-port=179/tcp
 firewall-cmd --permanent --add-port=4789/udp
-firewall-cmd --permanent --add-port=1514/tcp
-firewall-cmd --permanent --add-port=1515/tcp
-firewall-cmd --permanent --add-port=443/tcp
 firewall-cmd --permanent --add-port=30000-32767/tcp
-firewall-cmd --permanent --add-service=nfs
-firewall-cmd --permanent --add-service=rpc-bind
-firewall-cmd --permanent --add-service=mountd
+firewall-cmd --permanent --add-service={nfs,rpc-bind,mountd}
 firewall-cmd --reload
 ```
 
-### A5. Data SSD
+## 3.5. Разметка DATA (`sdb`) — indexer / manager
 
 ```bash
-# /dev/sdb — пример
-mkfs.xfs -f /dev/sdb
+lsblk
+parted /dev/sdb --script mklabel gpt mkpart primary xfs 1MiB 100%
+mkfs.xfs -f /dev/sdb1
 mkdir -p /data/wazuh
-UUID=$(blkid -s UUID -o value /dev/sdb)
+UUID=$(blkid -s UUID -o value /dev/sdb1)
 echo "UUID=${UUID} /data/wazuh xfs defaults,noatime 0 0" >>/etc/fstab
 mount -a
-mkdir -p /data/wazuh/indexer /data/wazuh/manager-master /data/wazuh/manager-worker
+# indexer:
+mkdir -p /data/wazuh/indexer /mnt/snapshots
+# manager:
+mkdir -p /data/wazuh/manager-master /data/wazuh/manager-worker
 ```
 
-На indexer дополнительно точка для снимков (после NFS):
-
-```bash
-mkdir -p /mnt/snapshots
-```
-
-### A6. containerd
+## 3.6. containerd + kubeadm
 
 ```bash
 dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-# или внутреннее зеркало
 dnf -y install containerd.io
 mkdir -p /etc/containerd
 containerd config default >/etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 systemctl enable --now containerd
-```
 
-### A7. kubeadm / kubelet / kubectl
-
-```bash
 cat >/etc/yum.repos.d/kubernetes.repo <<'EOF'
 [kubernetes]
 name=Kubernetes
@@ -168,29 +229,28 @@ systemctl enable --now kubelet
 
 ---
 
-# Часть B. Astra Linux SE 1.7 — подготовка нод K8s
+# Часть 4. Astra SE 1.7 и 1.8 — post-install на нодах K8s
 
-### B1. База
+## 4.1. Общее для 1.7 и 1.8
 
 ```bash
 hostnamectl set-hostname k8s-indexer
-# /etc/hosts — как в A1
+# /etc/hosts — как в 3.1
 
 apt-get update && apt-get -y upgrade
 apt-get -y install curl wget tar git ca-certificates apt-transport-https gnupg \
   lsb-release chrony conntrack iptables iproute2 socat ebtables ethtool \
-  nfs-common openssl
-systemctl enable --now chrony
-swapoff -a && sed -ri 's/.*swap.*/#&/' /etc/fstab
+  nfs-common openssl open-vm-tools
+systemctl enable --now chrony open-vm-tools
+swapoff -a
+sed -ri 's/.*swap.*/#&/' /etc/fstab
 ```
 
-Sysctl/modules — **как A3**.
+Sysctl/modules — **как §3.3**.
 
-### B2. MAC / ЗПС
+**MAC/ЗПС:** до containerd согласуйте с ИБ запуск kubelet/containerd/NFS/privileged CNI.
 
-На SE контейнеры часто блокируются политикой. До kubeadm согласуйте с ИБ профиль нод (containerd, kubelet, privileged CNI, NFS mount). Иначе типичны `NotReady` / `CreateContainerError`.
-
-### B3. Firewall (ufw)
+### Firewall
 
 ```bash
 apt-get -y install ufw
@@ -200,26 +260,26 @@ ufw allow 2379:2380/tcp
 ufw allow 10250/tcp
 ufw allow 179/tcp
 ufw allow 4789/udp
-ufw allow 1514/tcp
-ufw allow 1515/tcp
+ufw allow 1514:1515/tcp
 ufw allow 443/tcp
-ufw allow 30000:32767/tcp
 ufw allow 2049/tcp
+ufw allow 30000:32767/tcp
 ufw --force enable
 ```
 
-### B4. Диск data
+### DATA disk
 
 ```bash
-mkfs.ext4 -F /dev/sdb
-mkdir -p /data/wazuh
-UUID=$(blkid -s UUID -o value /dev/sdb)
+parted /dev/sdb --script mklabel gpt mkpart primary ext4 1MiB 100%
+mkfs.ext4 -F /dev/sdb1
+mkdir -p /data/wazuh /mnt/snapshots
+UUID=$(blkid -s UUID -o value /dev/sdb1)
 echo "UUID=${UUID} /data/wazuh ext4 defaults,noatime 0 0" >>/etc/fstab
 mount -a
-mkdir -p /data/wazuh/{indexer,manager-master,manager-worker} /mnt/snapshots
+mkdir -p /data/wazuh/{indexer,manager-master,manager-worker}
 ```
 
-### B5. containerd и Kubernetes
+## 4.2. containerd
 
 ```bash
 apt-get -y install containerd
@@ -227,30 +287,14 @@ mkdir -p /etc/containerd
 containerd config default >/etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 systemctl enable --now containerd
-# Нужен containerd ≥1.6; иначе пакет из внутреннего artifactory
+# На 1.7 проверьте версию ≥ 1.6
 ```
 
-Kube packages чаще **offline**:
+## 4.3. Kubernetes packages
+
+**Astra 1.8** (если есть доступ к pkgs.k8s.io / зеркалу):
 
 ```bash
-dpkg -i kubelet_*.deb kubeadm_*.deb kubectl_*.deb kubernetes-tools_*.deb kubernetes-cni_*.deb
-apt-get -f install -y
-apt-mark hold kubelet kubeadm kubectl
-systemctl enable --now kubelet
-```
-
-Calico: только VXLAN (eBPF на старом ядре 1.7 не включать).
-
----
-
-# Часть C. Astra Linux SE 1.8 — подготовка нод K8s
-
-Повторите B1–B4 (MAC/ЗПС тоже актуален). Пакеты новее (~Debian 12).
-
-```bash
-apt-get -y install containerd
-# systemd cgroup — как выше
-
 curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key \
   | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /' \
@@ -261,13 +305,24 @@ apt-mark hold kubelet kubeadm kubectl
 systemctl enable --now kubelet
 ```
 
-В закрытом контуре — те же offline `.deb`, что в B5.
+**Astra 1.7** (часто offline):
+
+```bash
+dpkg -i kubelet_*.deb kubeadm_*.deb kubectl_*.deb cri-tools_*.deb kubernetes-cni_*.deb
+apt-get -f install -y
+apt-mark hold kubelet kubeadm kubectl
+systemctl enable --now kubelet
+```
+
+На 1.7 Calico — только VXLAN (без eBPF).
 
 ---
 
-# Часть D. Кластер Kubernetes (все ОС)
+# Часть 5. Kubernetes + Wazuh (все ОС)
 
-### D1. init (только k8s-indexer)
+## 5.1. kubeadm init / join
+
+На `k8s-indexer`:
 
 ```bash
 kubeadm init \
@@ -281,41 +336,49 @@ chown $(id -u):$(id -g) $HOME/.kube/config
 kubeadm token create --print-join-command
 ```
 
-### D2. join + labels
-
-На manager и dashboard:
-
-```bash
-kubeadm join 10.10.10.11:6443 --token <TOKEN> --discovery-token-ca-cert-hash sha256:<HASH>
-```
-
-На CP:
+На manager и dashboard — `kubeadm join ...`.
 
 ```bash
 kubectl taint nodes k8s-indexer node-role.kubernetes.io/control-plane- || true
-kubectl label node k8s-indexer   role=indexer --overwrite
-kubectl label node k8s-manager   role=manager --overwrite
+kubectl label node k8s-indexer role=indexer --overwrite
+kubectl label node k8s-manager role=manager --overwrite
 kubectl label node k8s-dashboard role=dashboard --overwrite
 ```
 
-### D3. Calico
+## 5.2. Calico + MetalLB
 
 ```bash
 kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.3/manifests/calico.yaml
-# офлайн: из локального файла
-kubectl get nodes   # 3× Ready
+kubectl get nodes
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.5/config/manifests/metallb-native.yaml
 ```
 
-### D4. Storage (local PV на SSD)
+```yaml
+# metallb-pool.yaml
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata: { name: wazuh-pool, namespace: metallb-system }
+spec: { addresses: ["10.10.10.20-10.10.10.20"] }
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata: { name: wazuh-l2, namespace: metallb-system }
+```
 
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml
+kubectl apply -f metallb-pool.yaml
 ```
 
-Предпочтительнее **статические PV** (предсказуемый узел):
+## 5.3. Static PV под DATA
 
 ```yaml
 # pv-wazuh.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: { name: wazuh-local-ssd }
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+---
 apiVersion: v1
 kind: PersistentVolume
 metadata: { name: pv-wazuh-indexer }
@@ -360,48 +423,13 @@ spec:
       nodeSelectorTerms:
       - matchExpressions:
         - { key: role, operator: In, values: [manager] }
----
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata: { name: wazuh-local-ssd }
-provisioner: kubernetes.io/no-provisioner
-volumeBindingMode: WaitForFirstConsumer
 ```
 
 ```bash
 kubectl apply -f pv-wazuh.yaml
 ```
 
-### D5. MetalLB (VIP)
-
-```bash
-kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.5/config/manifests/metallb-native.yaml
-kubectl -n metallb-system wait --for=condition=Ready pods --all --timeout=180s
-```
-
-```yaml
-# metallb-pool.yaml
-apiVersion: metallb.io/v1beta1
-kind: IPAddressPool
-metadata: { name: wazuh-pool, namespace: metallb-system }
-spec: { addresses: ["10.10.10.20-10.10.10.20"] }
----
-apiVersion: metallb.io/v1beta1
-kind: L2Advertisement
-metadata: { name: wazuh-l2, namespace: metallb-system }
-```
-
-```bash
-kubectl apply -f metallb-pool.yaml
-```
-
-Альтернатива: внешний HAProxy на VIP → NodePorts сервисов Wazuh.
-
----
-
-# Часть E. Развёртывание Wazuh (все ОС)
-
-### E1. Репозиторий и сертификаты
+## 5.4. Деплой Wazuh с production limits
 
 ```bash
 git clone https://github.com/wazuh/wazuh-kubernetes.git -b v4.14.7 --depth=1
@@ -410,328 +438,285 @@ bash wazuh/certs/indexer_cluster/generate_certs.sh
 bash wazuh/certs/dashboard_http/generate_certs.sh
 ```
 
-### E2. Production patches (100 агентов)
+Обязательные значения в overlays/`local-env`:
 
-Обязательно изменить relative к дефолту:
-
-| Параметр | Значение |
+| | Значение |
 |---|---|
-| indexer replicas | **1** |
-| worker replicas | **1** |
-| indexer PVC | **300Gi**, SC `wazuh-local-ssd` |
-| master/worker PVC | **50Gi** |
-| master lim | **2 CPU / 4 Gi** |
-| worker lim | **4 CPU / 8 Gi** |
+| indexer replicas | 1 |
+| worker replicas | 1 |
+| indexer PVC | 300Gi, SC `wazuh-local-ssd` |
+| master PVC / lim | 50Gi / **2 CPU / 4 Gi** |
+| worker PVC / lim | 50Gi / **4 CPU / 8 Gi** |
 | indexer lim | **4 CPU / 24 Gi**, `OPENSEARCH_JAVA_OPTS=-Xms8g -Xmx8g` |
-| dashboard lim | **2 CPU / 4 Gi** |
-| nodeSelector | role=indexer\|manager\|dashboard |
+| dashboard lim | 2 CPU / 4 Gi |
+| nodeSelector | role=* |
 
-Пример патча indexer:
+В StatefulSet indexer добавьте volumeMount NFS (после части 6):
 
 ```yaml
-apiVersion: apps/v1
-kind: StatefulSet
-metadata: { name: wazuh-indexer }
-spec:
-  replicas: 1
-  template:
-    spec:
-      nodeSelector: { role: indexer }
-      containers:
-      - name: wazuh-indexer
-        resources:
-          requests: { cpu: "2", memory: 12Gi }
-          limits:   { cpu: "4", memory: 24Gi }
-        env:
-        - { name: OPENSEARCH_JAVA_OPTS, value: "-Xms8g -Xmx8g" }
-  volumeClaimTemplates:
-  - metadata: { name: wazuh-indexer }
-    spec:
-      accessModes: [ReadWriteOnce]
-      storageClassName: wazuh-local-ssd
-      resources: { requests: { storage: 300Gi } }
+volumeMounts:
+- name: snapshots
+  mountPath: /mnt/snapshots
+volumes:
+- name: snapshots
+  hostPath: { path: /mnt/snapshots, type: Directory }
 ```
 
-В `envs/local-env/storage-class.yaml` / kustomization — согласовать SC с `wazuh-local-ssd`, не создавать конфликтующий microk8s SC.
-
-### E3. Apply
+И в config OpenSearch: `path.repo: ["/mnt/snapshots"]`.
 
 ```bash
 kubectl apply -k envs/local-env/
 kubectl get pods -n wazuh -o wide -w
-kubectl get pvc -n wazuh
-kubectl get svc -n wazuh
+kubectl exec -n wazuh wazuh-manager-master-0 -- cat /var/ossec/etc/authd.pass
 ```
 
-Ожидание: 4 пода Running на нужных нодах.
-
-```bash
-kubectl exec -it -n wazuh wazuh-manager-master-0 -- cat /var/ossec/etc/authd.pass
-```
-
-Сменить пароли admin indexer / dashboard сразу после первого входа.
-
-### E4. Ingress dashboard (опционально)
-
-Backend часто HTTPS (порт сервиса dashboard — смотрите `kubectl get svc -n wazuh`). DNS → VIP.
-
-### E5. Выключить дорогой archives-индекс
-
-Убедитесь, что Filebeat **не** пишет полный `wazuh-archives-*` (или ISM delete для archives = 7 дней max). Иначе диск HOT не совпадёт с расчётом алертов.
+Сменить пароли admin. Не включать полный `wazuh-archives-*` без отдельного диска.
 
 ---
 
-# Часть F. ARCHIVE — куда уходят события после 90 дней
+# Часть 6. Сервер ARCHIVE — установка и ежедневная архивация
 
-Без этой части ISM delete = **безвозвратная потеря**.
+ВМ `wazuh-archive` **не** входит в Kubernetes.
 
-Рекомендуемый вариант: **NFS** (как в официальном [Migrating Wazuh indices](https://documentation.wazuh.com/current/user-manual/wazuh-indexer/migrating-wazuh-indices.html)).
+## 6.1. ОС и раздел DATA (все дистрибутивы)
 
-## F1. ВМ wazuh-archive (РЕД ОС 8)
+Hostname `wazuh-archive`, IP `10.10.10.14`, hosts как в §3.1, chrony, open-vm-tools, **без swap**.
+
+Разметка DATA:
 
 ```bash
-hostnamectl set-hostname wazuh-archive
-# hosts как выше
+# РЕД ОС
+parted /dev/sdb --script mklabel gpt mkpart primary xfs 1MiB 100%
+mkfs.xfs -f /dev/sdb1
+# Astra
+# mkfs.ext4 -F /dev/sdb1
 
-dnf -y install nfs-utils
-mkfs.xfs -f /dev/sdb    # 1 Ti
 mkdir -p /mnt/snapshots
-UUID=$(blkid -s UUID -o value /dev/sdb)
+UUID=$(blkid -s UUID -o value /dev/sdb1)
+# РЕД:
 echo "UUID=${UUID} /mnt/snapshots xfs defaults,noatime 0 0" >>/etc/fstab
+# Astra: fs=ext4
 mount -a
+df -h /mnt/snapshots   # ~1 Ti
+```
 
-echo "/mnt/snapshots 10.10.10.0/24(rw,sync,no_root_squash,no_subtree_check)" >>/etc/exports
+## 6.2. NFS server
+
+### РЕД ОС 8
+
+```bash
+dnf -y install nfs-utils
+echo "/mnt/snapshots 10.10.10.0/24(rw,sync,no_root_squash,no_subtree_check)" >/etc/exports
 systemctl enable --now nfs-server
-exportfs -a
-firewall-cmd --permanent --add-service=nfs --add-service=rpc-bind --add-service=mountd
+exportfs -rav
+firewall-cmd --permanent --add-service={nfs,rpc-bind,mountd}
 firewall-cmd --reload
 ```
 
-## F1b. ВМ wazuh-archive (Astra 1.7 / 1.8)
+### Astra 1.7 / 1.8
 
 ```bash
 apt-get -y install nfs-kernel-server
-mkfs.ext4 -F /dev/sdb
-mkdir -p /mnt/snapshots
-# fstab + mount
-echo "/mnt/snapshots 10.10.10.0/24(rw,sync,no_root_squash,no_subtree_check)" >>/etc/exports
-exportfs -a
+echo "/mnt/snapshots 10.10.10.0/24(rw,sync,no_root_squash,no_subtree_check)" >/etc/exports
+exportfs -rav
 systemctl enable --now nfs-kernel-server
 ```
 
-## F2. Mount NFS на ноде indexer (и во все indexer при HA)
-
-На **хосте** `k8s-indexer` (hostPath в под):
+Права (UID процесса wazuh-indexer в контейнере — проверьте `kubectl exec ... -- id`):
 
 ```bash
-# РЕД ОС: nfs-utils уже стоял; Astra: nfs-common
+chown -R 1000:1000 /mnt/snapshots
+chmod 755 /mnt/snapshots
+```
+
+## 6.3. Mount NFS на хосте k8s-indexer
+
+```bash
+# РЕД: nfs-utils; Astra: nfs-common — уже стоят
 mount -t nfs 10.10.10.14:/mnt/snapshots /mnt/snapshots
-echo "10.10.10.14:/mnt/snapshots /mnt/snapshots nfs defaults,_netdev 0 0" >>/etc/fstab
-# UID пользователя indexer в контейнере — часто 1000; на NFS:
-chown -R 1000:1000 /mnt/snapshots   # уточните id из пода
+echo "10.10.10.14:/mnt/snapshots /mnt/snapshots nfs defaults,_netdev,noatime 0 0" >>/etc/fstab
+mount -a
+touch /mnt/snapshots/.writetest && rm /mnt/snapshots/.writetest
 ```
 
-Проброс в StatefulSet indexer (patch):
+Пересоздайте pod indexer, если уже запущен, чтобы подхватить hostPath + `path.repo`.
 
-```yaml
-# фрагмент
-spec:
-  template:
-    spec:
-      containers:
-      - name: wazuh-indexer
-        volumeMounts:
-        - name: snapshots
-          mountPath: /mnt/snapshots
-      volumes:
-      - name: snapshots
-        hostPath:
-          path: /mnt/snapshots
-          type: Directory
-```
+## 6.4. Зарегистрировать snapshot repository
 
-В конфигурации OpenSearch/`opensearch.yml` образа должен быть:
+Dashboard: **Indexer management → Snapshot Management → Repositories → Create**
 
-```yaml
-path.repo: ["/mnt/snapshots"]
-```
-
-Если параметр не прокинут — добавьте через configmap/env манифеста wazuh-kubernetes (обязательная проверка после старта).
-
-Перезапуск пода indexer после mount:
-
-```bash
-kubectl delete pod -n wazuh wazuh-indexer-0
-# STS поднимет заново
-```
-
-## F3. Зарегистрировать snapshot repository
-
-Из Dashboard: **Indexer management → Snapshot Management → Repositories → Create**
-
+- Name: `wazuh-archive-repo`
 - Type: **Shared file system**
 - Location: `/mnt/snapshots`
-- Name: `wazuh-archive-repo`
 
-Или API:
+API:
 
 ```bash
-kubectl exec -n wazuh wazuh-indexer-0 -- curl -sk -u admin:<PASS> \
+kubectl exec -n wazuh wazuh-indexer-0 -- curl -sk -u admin:'PASS' \
   -H 'Content-Type: application/json' \
   -X PUT 'https://localhost:9200/_snapshot/wazuh-archive-repo' \
   -d '{"type":"fs","settings":{"location":"/mnt/snapshots","compress":true}}'
 ```
 
-## F4. Политика снимков (ежедневно)
-
-Dashboard → **Snapshot Management → Snapshot policies** (или SM Policies):
-
-- Имя: `daily-alerts`
-- Repository: `wazuh-archive-repo`
-- Indices: `wazuh-alerts-*`
-- Include cluster state: **yes**
-- Schedule: `0 2 * * *` (02:00)
-- Retention снимков на ARCHIVE: например **365 дней** (удалять snapshot старше года — это и есть «архивный retention»)
-
 Проверка:
 
 ```bash
-kubectl exec -n wazuh wazuh-indexer-0 -- curl -sk -u admin:<PASS> \
-  'https://localhost:9200/_snapshot/wazuh-archive-repo/_all?pretty' | head
+kubectl exec -n wazuh wazuh-indexer-0 -- curl -sk -u admin:'PASS' \
+  'https://localhost:9200/_snapshot/wazuh-archive-repo/_all?pretty'
 ```
 
-Алерт: если за 36 часов нет нового SUCCESS snapshot — pager/mail (внешний мониторинг или Watcher).
+## 6.5. Ежедневная архивация (каждый день в 02:00)
 
-## F5. ISM: HOT 90 дней → delete
+### Вариант A — Snapshot Management Policy (предпочтительно)
 
-Цель: индексы алертов старше 90 суток **удаляются с SSD**, опираясь на то, что дневные снимки уже на NFS.
+Dashboard → **Snapshot Management → Snapshot policies → Create policy**:
 
-Dashboard → **Indexer management → Index Management → State management policies**:
+| Поле | Значение |
+|---|---|
+| Policy name | `daily-wazuh-alerts` |
+| Repository | `wazuh-archive-repo` |
+| Source indices | `wazuh-alerts-*` |
+| Include cluster state | **Yes** |
+| Schedule | `0 2 * * *` (cron, 02:00 ежедневно) |
+| Snapshot retention | keep **365 days** (или max N снимков ≥ 365) |
 
-Пример политики (адаптируйте под имена индексов вашей версии):
+Сохраните политику, дождитесь первого SUCCESS (можно Run now для теста).
 
-```json
-{
-  "policy": {
-    "description": "HOT 90d then delete (archive via snapshots)",
-    "default_state": "hot",
-    "states": [
-      {
-        "name": "hot",
-        "actions": [],
-        "transitions": [
-          {
-            "state_name": "delete",
-            "conditions": { "min_index_age": "90d" }
-          }
-        ]
-      },
-      {
-        "name": "delete",
-        "actions": [{ "delete": {} }],
-        "transitions": []
-      }
-    ],
-    "ism_template": [{
-      "index_patterns": ["wazuh-alerts-*"],
-      "priority": 100
-    }]
-  }
-}
-```
-
-**Порядок внедрения (важно):**
-
-1. Сначала 7–14 дней стабильные daily snapshots.
-2. Потом включить ISM delete.
-3. Раз в квартал — учебный Restore одного старого индекса на стенде/в отдельном namespace.
-
-Опционально усиление: за 2 дня до delete отдельный snapshot только этого индекса (SM policy по age) — если политика SM это поддерживает в вашей версии OpenSearch.
-
-## F6. Процедура Restore (расследование инцидента >90 дней)
-
-1. Dashboard → Snapshot Management → Snapshots → выбрать снимок → **Restore**.
-2. Indices: нужный `wazuh-alerts-YYYY.MM.DD` (или паттерн).
-3. Не держать восстановленное на HOT дольше расследования.
-4. После — delete восстановленного индекса.
-
-Документируйте RTO: для 300 Gi full repo restore может занять часы — для точечного индекса обычно минуты–десятки минут.
-
-## F7. Альтернатива ARCHIVE: MinIO (S3)
-
-Если NFS нельзя:
-
-1. Поднять MinIO на `wazuh-archive` (диск 1 Ti), bucket `wazuh-snapshots`.
-2. Установить OpenSearch repository-s3 plugin **в образ/под indexer** (если не встроен) — проверьте совместимость образа Wazuh.
-3. Repository type **S3**, endpoint MinIO, keys в Kubernetes Secret.
-4. Те же daily policies + ISM.
-
-Для РЕД ОС/Astra в закрытом контуре NFS обычно проще (меньше plugins).
-
----
-
-# Часть G. Агенты, сеть, приёмка
-
-### G1. Агенты
+### Вариант B — cron на admin-хосте (если SM UI недоступен)
 
 ```bash
-export WAZUH_MANAGER='10.10.10.20'              # :1514 workers
-export WAZUH_REGISTRATION_SERVER='10.10.10.20'  # :1515 master
-export WAZUH_REGISTRATION_PASSWORD='<authd.pass>'
-# установить агент той же major-версии 4.14.x
+# /usr/local/bin/wazuh-daily-snapshot.sh
+set -euo pipefail
+PASS=...   # из secret / vault
+NAME="daily-$(date -u +%Y.%m.%d)"
+kubectl exec -n wazuh wazuh-indexer-0 -- curl -sk -u "admin:${PASS}" \
+  -H 'Content-Type: application/json' \
+  -X PUT "https://localhost:9200/_snapshot/wazuh-archive-repo/${NAME}?wait_for_completion=true" \
+  -d '{"indices":"wazuh-alerts-*","include_global_state":true}'
 ```
 
-### G2. Чеклист
+Cron: `0 2 * * * root /usr/local/bin/wazuh-daily-snapshot.sh >>/var/log/wazuh-snap.log 2>&1`
 
-- [ ] 3 K8s-ноды Ready + labels
-- [ ] `vm.max_map_count=262144`
-- [ ] 4 пода Wazuh Running; PVC Bound
-- [ ] VIP :1514/:1515/:443
-- [ ] NFS смонтирован, `path.repo` активен
-- [ ] Repository `wazuh-archive-repo` зелёный
-- [ ] Есть успешный тестовый snapshot
-- [ ] ISM policy на `wazuh-alerts-*` (после периода обкатки снимков)
-- [ ] Тестовый Restore одного индекса
-- [ ] Мониторинг: disk HOT, disk ARCHIVE, snapshot SUCCESS, `events_dropped=0`, `discarded_count=0`
-- [ ] Пароли сменены; `wazuh-archives-*` не раздувает диск
+Плюс отдельный job очистки снимков старше 365 дней через Snapshot Management retention или API delete.
 
-### G3. Типовые проблемы
+## 6.6. ISM: удаление с HOT после 90 дней
 
-| Симптом | Причина / действие |
+**Только после 7–14 дней успешных daily snapshots.**
+
+Dashboard → Index Management → State management policies:
+
+- Pattern: `wazuh-alerts-*`
+- State `hot` → transition to `delete` when `min_index_age: 90d`
+- State `delete` → action `delete`
+
+Так HOT SSD не растёт бесконечно; история остаётся в снимках на `wazuh-archive`.
+
+## 6.7. Мониторинг ARCHIVE
+
+Ежедневно проверять:
+
+1. Последний snapshot = SUCCESS, age < 36h  
+2. `df -h /mnt/snapshots` на archive < 80%  
+3. `exportfs -v` и mount на indexer живы  
+4. `events_dropped` / `discarded_count` = 0 на worker  
+
+---
+
+# Часть 7. Как достать архив и смотреть в Wazuh
+
+Снимки на NFS **не отображаются** в Discover, пока не сделан Restore.
+
+## 7.1. Через Dashboard (основной способ)
+
+1. Войти в Wazuh Dashboard.  
+2. ☰ → **Indexer management** → **Snapshot Management** → **Snapshots**.  
+3. Найти снимок нужной даты (или `daily-YYYY.MM.DD`).  
+4. Actions → **Restore**.  
+5. Выбрать индексы (`wazuh-alerts-2025.01.15` и т.п.).  
+6. Advanced: не включать лишние rename, если хотите исходные имена (следите за конфликтами с живыми индексами).  
+7. Дождаться завершения Restore.  
+8. ☰ → **Discover** (или Security events / Threat Hunting).  
+9. Index pattern: `wazuh-alerts-*`.  
+10. Выставить календарь на даты восстановленного периода.  
+11. Анализировать как обычно (фильтры, agent.name, rule.id …).  
+12. **После расследования** удалить восстановленные индексы (Index Management → Delete), чтобы освободить HOT.  
+13. Снимок на ARCHIVE при этом **не удаляется**.
+
+## 7.2. Через API
+
+```bash
+# список снимков
+kubectl exec -n wazuh wazuh-indexer-0 -- curl -sk -u admin:'PASS' \
+  'https://localhost:9200/_snapshot/wazuh-archive-repo/_all?pretty'
+
+# restore одного индекса
+kubectl exec -n wazuh wazuh-indexer-0 -- curl -sk -u admin:'PASS' \
+  -H 'Content-Type: application/json' \
+  -X POST 'https://localhost:9200/_snapshot/wazuh-archive-repo/daily-2025.01.15/_restore' \
+  -d '{"indices":"wazuh-alerts-2025.01.15","include_global_state":false}'
+```
+
+Свободное место на `/data/wazuh/indexer` должно покрывать размер индекса + ~20%.
+
+## 7.3. Типовые ошибки Restore
+
+| Симптом | Что делать |
 |---|---|
-| Indexer про max virtual memory | `sysctl vm.max_map_count` |
-| Snapshot FAIL / repository verification | NFS mount, права 1000:1000, `path.repo`, firewall 2049 |
-| PVC Pending | PV nodeAffinity / путь `/data/wazuh/...` |
-| Agent no connection | VIP 1514/1515, authd.pass |
-| HOT растёт >90d | ISM не применён / индексы не матчят pattern |
-| ARCHIVE полный | чистить snapshot retention / расширить 1 Ti |
-| Astra CreateContainerError | MAC/ЗПС |
-| РЕД ОС permission | SELinux audit на volumes/NFS |
+| Repository verification failed | NFS mount, firewall 2049, path.repo, chown 1000 |
+| No space | освободить HOT / временно расширить vmdk 300 Gi в ESXi |
+| Index already exists | restore под другим именем или удалить конфликтующий |
+| Пустой Discover | неверный time range / index pattern |
 
 ---
 
-# Часть H. Отличия ОС (сводка)
+# Часть 8. Агенты и приёмка
 
-| Шаг | РЕД ОС 8 | Astra 1.7 | Astra 1.8 |
+## 8.1. Агенты
+
+```bash
+export WAZUH_MANAGER='10.10.10.20'
+export WAZUH_REGISTRATION_SERVER='10.10.10.20'
+export WAZUH_REGISTRATION_PASSWORD='...'
+# пакет агента 4.14.x
+```
+
+## 8.2. Чеклист
+
+- [ ] 4 ВМ в ESXi 7: PVSCSI, VMXNET3, EFI, ресурсы по таблице  
+- [ ] Разделы: EFI+boot+/, без swap; DATA смонтирован  
+- [ ] 3 ноды K8s Ready, labels role=*  
+- [ ] 4 пода Wazuh Running, PVC Bound  
+- [ ] VIP :1514/:1515/:443  
+- [ ] NFS archive → indexer, repository OK  
+- [ ] Тестовый snapshot SUCCESS  
+- [ ] Daily policy 02:00 создана  
+- [ ] Учебный Restore → данные видны в Discover → индекс удалён с HOT  
+- [ ] ISM 90d включён после обкатки снимков  
+- [ ] open-vm-tools, chrony, пароли сменены  
+
+## 8.3. Расширение дисков в ESXi позже
+
+1. Edit VM → увеличить vmdk DATA.  
+2. В госте: `parted` resize / `xfs_growfs` или `resize2fs`.  
+3. Для PVC: при static PV — обновить capacity PV/PVC согласованно.
+
+---
+
+# Часть 9. Сводка отличий ОС
+
+| | РЕД ОС 8 | Astra 1.7 | Astra 1.8 |
 |---|---|---|---|
-| Пакеты | dnf | apt (старше) | apt (~Debian 12) |
-| FS data | xfs | ext4 | ext4/xfs |
-| Firewall | firewalld | ufw | ufw |
-| MAC | SELinux | ЗПС/PARSEC | ЗПС/PARSEC |
+| Разметка installer | Anaconda | Astra installer | Astra installer |
+| FS | xfs | ext4 | ext4 |
 | NFS server | nfs-utils | nfs-kernel-server | nfs-kernel-server |
-| NFS client | nfs-utils | nfs-common | nfs-common |
-| K8s+Wazuh+ARCHIVE | далее одинаково | одинаково | одинаково |
-
----
-
-# Часть I. Если масштабируете до 1000 агентов
-
-См. [wazuh-architecture.md](wazuh-architecture.md) §8: 3 indexer × 2 Ti, 3 workers, LB обязателен, ARCHIVE **8–10 Ti**, NFS mount на **каждой** indexer-ноде к одному export (или MinIO). ISM/snapshot политики те же, меняются только размеры и число реплик.
+| K8s packages | dnf/rpm | чаще offline deb | apt или offline |
+| MAC | SELinux | ЗПС | ЗПС |
+| Дальше (K8s/Wazuh/ARCHIVE) | одинаково | одинаково | одинаково |
 
 ---
 
 ## Ссылки
 
-- Архитектура: [wazuh-architecture.md](wazuh-architecture.md)
-- Snapshots / NFS: https://documentation.wazuh.com/current/user-manual/wazuh-indexer/migrating-wazuh-indices.html
-- Deploy on Kubernetes: https://documentation.wazuh.com/current/deployment-options/deploying-with-kubernetes/index.html
+- Архитектура: [wazuh-architecture.md](wazuh-architecture.md)  
+- Snapshots NFS (Wazuh): https://documentation.wazuh.com/current/user-manual/wazuh-indexer/migrating-wazuh-indices.html  
+- Deploy K8s: https://documentation.wazuh.com/current/deployment-options/deploying-with-kubernetes/index.html  
