@@ -123,18 +123,21 @@ end_stage_fail() {
   error "Этап «${CURRENT_STAGE}»: ${detail}"
 }
 
-# Выполнить команду с полным дебагом при ошибке
+# Выполнить команду с полным дебагом при ошибке.
+# Не меняет глобальный set -e вызывающего скрипта.
 run_cmd() {
   local desc="$1"; shift
   info "Команда: ${desc}"
   debug "+ $*"
   local out_file rc
+  local had_errexit=0
+  [[ $- == *e* ]] && had_errexit=1
   out_file="$(mktemp)"
   set +e
   "$@" >"${out_file}" 2>&1
   rc=$?
-  set -e
-  cat "${out_file}" >>"${DEBUG_FILE}"
+  if [[ ${had_errexit} -eq 1 ]]; then set -e; else set +e; fi
+  cat "${out_file}" >>"${DEBUG_FILE}" || true
   if [[ ${rc} -ne 0 ]]; then
     error "FAIL (${rc}): ${desc}"
     error "Команда: $*"
@@ -144,7 +147,6 @@ run_cmd() {
     rm -f "${out_file}"
     return "${rc}"
   fi
-  # краткий stdout в отчёт
   if [[ -s "${out_file}" ]]; then
     local lines
     lines="$(wc -l <"${out_file}" | tr -d ' ')"
